@@ -1,5 +1,5 @@
 param(
-    [string] $Executable = "$PSScriptRoot\..\bin\OpenFiles.exe",
+    [string] $Executable = "$PSScriptRoot\..\bin\x64\Release\OpenFiles.exe",
     [int] $TimeoutSeconds = 180
 )
 $ErrorActionPreference = 'Stop'

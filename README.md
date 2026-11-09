@@ -7,19 +7,12 @@ snapshot. Run elevated. The embedded manifest requests administrator privileges.
 ## Build and run
 
 Install Visual Studio 2022's **Desktop development with C++** workload, including
-the MSVC v143 x64 tools and a Windows 10/11 SDK. No Visual Studio solution or
-project files are included. From the repository root in an **x64 Native Tools
-Command Prompt for VS 2022**, compile the sources directly:
+the MSVC v143 x64 tools and a Windows 10/11 SDK. Open `OpenFiles.sln`, select
+**Release | x64**, and build. Alternatively, in a VS 2022 Developer Command Prompt:
 
 ```bat
-if not exist bin mkdir bin
-if not exist obj mkdir obj
-cl /nologo /std:c++17 /EHsc /W4 /O2 /utf-8 ^
-   /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
-   /D_WIN32_WINNT=0x0A00 /Foobj\ /Febin\OpenFiles.exe ^
-   src\OpenFiles.cpp src\main.cpp /link Advapi32.lib /SUBSYSTEM:CONSOLE ^
-   /MANIFEST:EMBED /MANIFESTUAC:"level='requireAdministrator' uiAccess='false'"
-bin\OpenFiles.exe
+msbuild OpenFiles.sln /m /p:Configuration=Release /p:Platform=x64
+bin\x64\Release\OpenFiles.exe
 ```
 
 Before listing paths, the program prints the time spent inside
@@ -30,7 +23,7 @@ Space advances a page, Enter advances one path, and Q or Escape exits. `--all`
 disables paging. Redirected output is UTF-8 without a BOM, with no prompts:
 
 ```bat
-bin\OpenFiles.exe --all > open-files.txt
+bin\x64\Release\OpenFiles.exe --all > open-files.txt
 ```
 
 ## API and avoiding hangs
@@ -44,6 +37,13 @@ The returned vector is sorted and contains unique path strings, without
 directories. Extended-length prefixes (`\\?\C:\...`, `\\?\UNC\...`, or a volume
 GUID path for an unmounted volume) are preserved. Names can differ for hard
 links, aliases, or case variants; uniqueness is by exact string, not file ID.
+
+Handles owned by Visual Studio (`devenv.exe`, matched case-insensitively) are
+excluded before duplication and path queries. The process image name is queried
+once per process using the same process handle used for duplication. A file
+also opened by another included process can still appear in the returned list.
+This filter targets the IDE executable; separate build tools and ServiceHub
+processes are not excluded by association.
 
 The implementation dynamically loads `NtQuerySystemInformation` and requests
 `SystemExtendedHandleInformation`. It discovers the current File object type
@@ -72,7 +72,8 @@ different executable requires the same dispatch or a dedicated worker binary.
   file handles have closed are not included.
 - Administrator access and `SeDebugPrivilege` do not bypass protected-process
   restrictions. Inaccessible processes/handles, failed name queries, and timed-out
-  queries are skipped. Slow remote filesystems can therefore be omitted too.
+  queries are skipped. Processes whose image names cannot be queried are also
+  skipped. Slow remote filesystems can therefore be omitted too.
 - SMB files reported as `FILE_TYPE_DISK` are included if they respond in time.
   Closed/deleted file names may no longer resolve to an existing path.
 - Snapshot, allocation, or helper startup failures throw an exception; `wmain`
@@ -89,7 +90,7 @@ different executable requires the same dispatch or a dedicated worker binary.
 From an **elevated PowerShell** after building:
 
 ```powershell
-.\tests\smoke.ps1 -Executable .\bin\OpenFiles.exe
+.\tests\smoke.ps1 -Executable .\bin\x64\Release\OpenFiles.exe
 ```
 
 This keeps a Unicode-named disk file and an unconnected named pipe open in the

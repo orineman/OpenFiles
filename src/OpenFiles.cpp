@@ -59,6 +59,19 @@ std::wstring ExecutablePath() {
     return path;
 }
 
+bool ShouldListProcess(HANDLE process) {
+    std::wstring image(MaxPathCharacters, L'\0');
+    DWORD length = static_cast<DWORD>(image.size());
+    // Query the same process handle used for duplication, rather than matching
+    // a PID from a separate snapshot that could already have been reused.
+    if (!QueryFullProcessImageNameW(process, 0, image.data(), &length)) return false;
+    image.resize(length);
+    const size_t separator = image.find_last_of(L"\\/");
+    const wchar_t* name = image.c_str() +
+        (separator == std::wstring::npos ? 0 : separator + 1);
+    return CompareStringOrdinal(name, -1, L"devenv.exe", -1, TRUE) != CSTR_EQUAL;
+}
+
 // Restore the caller's privilege state when enumeration finishes. Failure to
 // enable SeDebugPrivilege is not fatal; accessible processes can still be read.
 class DebugPrivilege {
@@ -377,9 +390,12 @@ std::vector<std::wstring> ListOpenDiskFiles() {
         if (entry.UniqueProcessId != lastPid) {
             lastPid = entry.UniqueProcessId;
             process.reset();
-            if (lastPid && lastPid <= MAXDWORD)
-                process.reset(OpenProcess(PROCESS_DUP_HANDLE, FALSE,
+            if (lastPid && lastPid <= MAXDWORD) {
+                process.reset(OpenProcess(PROCESS_DUP_HANDLE |
+                                           PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
                                            static_cast<DWORD>(lastPid)));
+                if (process && !ShouldListProcess(process.get())) process.reset();
+            }
         }
         if (!process) continue;
         auto path = worker.Query(process.get(), reinterpret_cast<HANDLE>(entry.HandleValue));
