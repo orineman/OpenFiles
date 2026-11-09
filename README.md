@@ -1,7 +1,7 @@
 # OpenFiles
 
-A Windows 10/11 x64 console application for Visual Studio 2022. Lists unique
-full paths of open disk files across processes, using a best-effort system handle
+A Windows 10/11 x64 console application for Visual Studio 2022. Lists open disk
+files grouped by process, using a best-effort system handle
 snapshot. Run elevated. The embedded manifest requests administrator privileges.
 
 ## Build and run
@@ -17,7 +17,10 @@ bin\x64\Release\OpenFiles.exe
 
 Before listing paths, the program prints the time spent inside
 `ListOpenDiskFiles()` in milliseconds and the number of files in its returned
-vector. Timing uses a monotonic clock and excludes printing and paging delays.
+vector (process/file entries, so a shared file counts once per process). Timing
+uses a monotonic clock and excludes printing and paging delays. Each process
+heading contains its executable's full path and PID, followed by indented file
+paths. Separate instances of the same executable have separate groups.
 The console displays roughly one screen at a time, allowing for wrapped paths.
 Space advances a page, Enter advances one path, and Q or Escape exits. `--all`
 disables paging. Redirected output is UTF-8 without a BOM, with no prompts:
@@ -30,13 +33,17 @@ bin\x64\Release\OpenFiles.exe --all > open-files.txt
 
 ```cpp
 // src/OpenFiles.h
-std::vector<std::wstring> ListOpenDiskFiles();
+std::vector<std::pair<std::wstring, std::wstring>> ListOpenDiskFiles();
 ```
 
-The returned vector is sorted and contains unique path strings, without
-directories. Extended-length prefixes (`\\?\C:\...`, `\\?\UNC\...`, or a volume
+Each pair contains a process identifier (full executable path plus ` (PID n)`)
+and the full file path. The vector is sorted by process identifier, then by file
+path, and contains unique pairs. Multiple handles to one path in the same
+process yield one entry; the same path held by different processes appears once
+for each process, including separate instances of the same executable.
+Directories are omitted. Extended-length prefixes (`\\?\C:\...`, `\\?\UNC\...`, or a volume
 GUID path for an unmounted volume) are preserved. Names can differ for hard
-links, aliases, or case variants; uniqueness is by exact string, not file ID.
+links, aliases, or case variants; uniqueness is by exact pair of strings, not file ID.
 
 Handles owned by Visual Studio (`devenv.exe`, matched case-insensitively) are
 excluded before duplication and path queries. The process image name is queried
@@ -93,10 +100,11 @@ From an **elevated PowerShell** after building:
 .\tests\smoke.ps1 -Executable .\bin\x64\Release\OpenFiles.exe
 ```
 
-This keeps a Unicode-named disk file and an unconnected named pipe open in the
-test process. It verifies that the disk file appears exactly once, the pipe is
-excluded, the summary precedes the paths and reports their count, redirected
-output contains no paging prompt, and enumeration finishes
+This keeps two handles to a Unicode-named disk file and an unconnected named pipe
+open in the test process, and launches a second process that also holds the file
+open. It verifies one file entry for each PID, deduplication within a process,
+grouped output with process identities, pipe exclusion, the summary and entry
+count, absence of paging prompts when redirected, and enumeration finishing
 within the test deadline. The deadline is a smoke-test guard, not a product-wide
 scan timeout. Interactive page/line/quit behavior should also be checked in a
 Windows console with enough open files to fill several pages.

@@ -77,7 +77,7 @@ int wmain(int argc, wchar_t* argv[]) {
             GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &inputMode) &&
             GetConsoleMode(output, &outputMode);
         size_t rows = 3; // include the summary and blank line on the first page
-        for (size_t i = 0; i < files.size(); ++i) {
+        const auto printLine = [&](const std::wstring& line, bool more) {
             CONSOLE_SCREEN_BUFFER_INFO screen{};
             size_t pageRows = 23, width = 80;
             if (paginate && GetConsoleScreenBufferInfo(output, &screen)) {
@@ -85,13 +85,21 @@ int wmain(int argc, wchar_t* argv[]) {
                     screen.srWindow.Bottom - screen.srWindow.Top - 1));
                 width = static_cast<size_t>((std::max)(1, int(screen.dwSize.X)));
             }
-            Print(files[i] + L"\r\n");
-            rows += 1 + files[i].size() / width; // allow for wrapped long paths
-            if (paginate && rows >= pageRows && i + 1 < files.size()) {
+            Print(line + L"\r\n");
+            rows += 1 + line.size() / width; // allow for wrapped long paths
+            if (paginate && rows >= pageRows && more) {
                 const int key = Pause();
-                if (key == L'q' || key == L'Q' || key == 27) return 0;
+                if (key == L'q' || key == L'Q' || key == 27) return false;
                 rows = key == L'\r' ? pageRows - 1 : 0;
             }
+            return true;
+        };
+        for (size_t i = 0; i < files.size(); ++i) {
+            if (i == 0 || files[i].first != files[i - 1].first) {
+                if (i != 0 && !printLine(L"", true)) return 0;
+                if (!printLine(files[i].first, true)) return 0;
+            }
+            if (!printLine(L"  " + files[i].second, i + 1 < files.size())) return 0;
         }
         return 0;
     } catch (const std::exception& error) {
