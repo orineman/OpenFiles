@@ -7,20 +7,30 @@ snapshot. Run elevated. The embedded manifest requests administrator privileges.
 ## Build and run
 
 Install Visual Studio 2022's **Desktop development with C++** workload, including
-the MSVC v143 x64 tools and a Windows 10/11 SDK. Open `OpenFiles.sln`, select
-**Release | x64**, and build. Alternatively, in a VS 2022 Developer Command Prompt:
+the MSVC v143 x64 tools and a Windows 10/11 SDK. No Visual Studio solution or
+project files are included. From the repository root in an **x64 Native Tools
+Command Prompt for VS 2022**, compile the sources directly:
 
 ```bat
-msbuild OpenFiles.sln /m /p:Configuration=Release /p:Platform=x64
-bin\x64\Release\OpenFiles.exe
+if not exist bin mkdir bin
+if not exist obj mkdir obj
+cl /nologo /std:c++17 /EHsc /W4 /O2 /utf-8 ^
+   /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+   /D_WIN32_WINNT=0x0A00 /Foobj\ /Febin\OpenFiles.exe ^
+   src\OpenFiles.cpp src\main.cpp /link Advapi32.lib /SUBSYSTEM:CONSOLE ^
+   /MANIFEST:EMBED /MANIFESTUAC:"level='requireAdministrator' uiAccess='false'"
+bin\OpenFiles.exe
 ```
 
+Before listing paths, the program prints the time spent inside
+`ListOpenDiskFiles()` in milliseconds and the number of files in its returned
+vector. Timing uses a monotonic clock and excludes printing and paging delays.
 The console displays roughly one screen at a time, allowing for wrapped paths.
 Space advances a page, Enter advances one path, and Q or Escape exits. `--all`
 disables paging. Redirected output is UTF-8 without a BOM, with no prompts:
 
 ```bat
-bin\x64\Release\OpenFiles.exe --all > open-files.txt
+bin\OpenFiles.exe --all > open-files.txt
 ```
 
 ## API and avoiding hangs
@@ -79,18 +89,18 @@ different executable requires the same dispatch or a dedicated worker binary.
 From an **elevated PowerShell** after building:
 
 ```powershell
-.\tests\smoke.ps1 -Executable .\bin\x64\Release\OpenFiles.exe
+.\tests\smoke.ps1 -Executable .\bin\OpenFiles.exe
 ```
 
 This keeps a Unicode-named disk file and an unconnected named pipe open in the
 test process. It verifies that the disk file appears exactly once, the pipe is
-excluded, redirected output contains no paging prompt, and enumeration finishes
+excluded, the summary precedes the paths and reports their count, redirected
+output contains no paging prompt, and enumeration finishes
 within the test deadline. The deadline is a smoke-test guard, not a product-wide
 scan timeout. Interactive page/line/quit behavior should also be checked in a
 Windows console with enough open files to fill several pages.
 
 The implementation was cross-compiled and linked as an x64 Windows executable
-using MinGW-w64 GCC 14 with strict warnings. The Visual Studio project XML and
-source paths were also checked. The Linux development host cannot run MSVC or
-validate native Windows handle enumeration; the Windows smoke test and console
+using MinGW-w64 GCC 14 with strict warnings. The Linux development host cannot run
+MSVC or validate native Windows handle enumeration; the Windows smoke test and console
 interaction checks have not been run here.

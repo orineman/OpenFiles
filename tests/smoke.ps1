@@ -1,5 +1,5 @@
 param(
-    [string] $Executable = "$PSScriptRoot\..\bin\x64\Release\OpenFiles.exe",
+    [string] $Executable = "$PSScriptRoot\..\bin\OpenFiles.exe",
     [int] $TimeoutSeconds = 180
 )
 $ErrorActionPreference = 'Stop'
@@ -41,7 +41,15 @@ try {
     $text = $stdout.GetAwaiter().GetResult()
     $errors = $stderr.GetAwaiter().GetResult()
     if ($process.ExitCode -ne 0) { throw "Exit $($process.ExitCode): $errors" }
-    $lines = @($text -split '\r?\n' | Where-Object { $_.Length -gt 0 })
+    $outputLines = @($text -split '\r?\n')
+    if ($outputLines.Count -lt 3 -or $outputLines[0] -cnotmatch '^Time taken: [0-9]+ ms$' -or
+        $outputLines[1] -cnotmatch '^Files: [0-9]+$' -or $outputLines[2] -ne '') {
+        throw 'Expected elapsed time and file count before the list.'
+    }
+    $lines = @($outputLines | Select-Object -Skip 3 | Where-Object { $_.Length -gt 0 })
+    if ([long]($outputLines[1].Substring(7)) -ne $lines.Count) {
+        throw 'Reported file count does not match the list.'
+    }
     $matches = @($lines | Where-Object { $_ -ceq ('\\?\' + $path) })
     if ($matches.Count -ne 1) {
         throw "Expected exactly one path for the held Unicode file; got $($matches.Count)."

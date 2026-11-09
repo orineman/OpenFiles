@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <conio.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cwchar>
 #include <stdexcept>
@@ -64,13 +65,18 @@ int wmain(int argc, wchar_t* argv[]) {
             return 2;
         }
 
+        const auto start = std::chrono::steady_clock::now();
         const auto files = ListOpenDiskFiles();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        Print(L"Time taken: " + std::to_wstring(elapsed.count()) + L" ms\r\n" +
+              L"Files: " + std::to_wstring(files.size()) + L"\r\n\r\n");
         DWORD inputMode = 0, outputMode = 0;
         const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
         const bool paginate = !all &&
             GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &inputMode) &&
             GetConsoleMode(output, &outputMode);
-        size_t rows = 0;
+        size_t rows = 3; // include the summary and blank line on the first page
         for (size_t i = 0; i < files.size(); ++i) {
             CONSOLE_SCREEN_BUFFER_INFO screen{};
             size_t pageRows = 23, width = 80;
