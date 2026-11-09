@@ -59,17 +59,21 @@ std::wstring ExecutablePath() {
     return path;
 }
 
-bool ShouldListProcess(HANDLE process) {
+std::wstring ProcessIdentifier(HANDLE process) {
     std::wstring image(MaxPathCharacters, L'\0');
     DWORD length = static_cast<DWORD>(image.size());
     // Query the same process handle used for duplication, rather than matching
     // a PID from a separate snapshot that could already have been reused.
-    if (!QueryFullProcessImageNameW(process, 0, image.data(), &length)) return false;
+    if (!QueryFullProcessImageNameW(process, 0, image.data(), &length)) return {};
     image.resize(length);
     const size_t separator = image.find_last_of(L"\\/");
     const wchar_t* name = image.c_str() +
         (separator == std::wstring::npos ? 0 : separator + 1);
-    return CompareStringOrdinal(name, -1, L"devenv.exe", -1, TRUE) != CSTR_EQUAL;
+    if (CompareStringOrdinal(name, -1, L"devenv.exe", -1, TRUE) == CSTR_EQUAL)
+        return {};
+    const DWORD pid = GetProcessId(process);
+    if (!pid) return {};
+    return image + L" (PID " + std::to_wstring(pid) + L")";
 }
 
 // Restore the caller's privilege state when enumeration finishes. Failure to
@@ -353,7 +357,7 @@ int RunFileQueryWorker() {
     return 0;
 }
 
-std::vector<std::wstring> ListOpenDiskFiles() {
+std::vector<std::pair<std::wstring, std::wstring>> ListOpenDiskFiles() {
     DebugPrivilege privilege;
     // Discover the File object type index from a known real file in this very
     // snapshot. Object type numbers are not stable across Windows versions.
@@ -384,24 +388,27 @@ std::vector<std::wstring> ListOpenDiskFiles() {
 
     QueryWorker worker;
     Handle process;
+    std::wstring processIdentifier;
     ULONG_PTR lastPid = (std::numeric_limits<ULONG_PTR>::max)();
-    std::vector<std::wstring> paths;
+    std::vector<std::pair<std::wstring, std::wstring>> files;
     for (const auto& entry : entries) {
         if (entry.UniqueProcessId != lastPid) {
             lastPid = entry.UniqueProcessId;
             process.reset();
+            processIdentifier.clear();
             if (lastPid && lastPid <= MAXDWORD) {
                 process.reset(OpenProcess(PROCESS_DUP_HANDLE |
                                            PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
                                            static_cast<DWORD>(lastPid)));
-                if (process && !ShouldListProcess(process.get())) process.reset();
+                if (process) processIdentifier = ProcessIdentifier(process.get());
+                if (processIdentifier.empty()) process.reset();
             }
         }
         if (!process) continue;
         auto path = worker.Query(process.get(), reinterpret_cast<HANDLE>(entry.HandleValue));
-        if (!path.empty()) paths.push_back(std::move(path));
+        if (!path.empty()) files.emplace_back(processIdentifier, std::move(path));
     }
-    std::sort(paths.begin(), paths.end());
-    paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
-    return paths;
+    std::sort(files.begin(), files.end());
+    files.erase(std::unique(files.begin(), files.end()), files.end());
+    return files;
 }

@@ -16,6 +16,7 @@ $file = $null
 $second = $null
 $pipe = $null
 $process = $null
+$holder = $null
 try {
     $file = [IO.File]::Open($path, [IO.FileMode]::CreateNew,
         [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
@@ -23,6 +24,38 @@ try {
         [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
     # No client connects; querying an arbitrary pipe's object name can hang.
     $pipe = [IO.Pipes.NamedPipeServerStream]::new($name)
+
+    # Keep the same file open in a second process throughout enumeration. Use
+    # the current PowerShell executable when possible to cover two instances
+    # with the same executable name but different PIDs.
+    $shell = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    if ([IO.Path]::GetFileName($shell) -notin @('powershell.exe', 'pwsh.exe')) {
+        $shell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    }
+    $encodedPath = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($path))
+    $holdScript = @"
+`$path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encodedPath'))
+`$file = [IO.File]::Open(`$path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+try {
+    [Console]::Out.WriteLine('READY')
+    [Console]::Out.Flush()
+    [void][Console]::In.ReadLine()
+} finally { `$file.Dispose() }
+"@
+    $holdStart = [Diagnostics.ProcessStartInfo]::new()
+    $holdStart.FileName = $shell
+    $holdStart.Arguments = '-NoLogo -NoProfile -NonInteractive -EncodedCommand ' +
+        [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($holdScript))
+    $holdStart.UseShellExecute = $false
+    $holdStart.CreateNoWindow = $true
+    $holdStart.RedirectStandardInput = $true
+    $holdStart.RedirectStandardOutput = $true
+    $holdStart.RedirectStandardError = $true
+    $holder = [Diagnostics.Process]::Start($holdStart)
+    $ready = $holder.StandardOutput.ReadLineAsync()
+    if (-not $ready.Wait(15000) -or $ready.GetAwaiter().GetResult() -ne 'READY') {
+        throw 'The second file-holding process did not become ready.'
+    }
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $exe
     # Omit --all intentionally: output redirection itself must disable paging.
@@ -46,26 +79,54 @@ try {
         $outputLines[1] -cnotmatch '^Files: [0-9]+$' -or $outputLines[2] -ne '') {
         throw 'Expected elapsed time and file count before the list.'
     }
-    $lines = @($outputLines | Select-Object -Skip 3 | Where-Object { $_.Length -gt 0 })
-    if ([long]($outputLines[1].Substring(7)) -ne $lines.Count) {
+    $entries = @()
+    $currentProcess = $null
+    $seenProcesses = @()
+    foreach ($line in ($outputLines | Select-Object -Skip 3)) {
+        if ($line.Length -eq 0) { continue }
+        if ($line.StartsWith('  ')) {
+            if (-not $currentProcess) { throw 'A file appeared before its process heading.' }
+            $entries += [pscustomobject]@{ Process = $currentProcess; File = $line.Substring(2) }
+        } else {
+            if ($line -cnotmatch '^.+ \(PID [1-9][0-9]*\)$') {
+                throw "Invalid process heading: $line"
+            }
+            if ($seenProcesses -ccontains $line) { throw 'A process appears in separate groups.' }
+            $seenProcesses += $line
+            $currentProcess = $line
+        }
+    }
+    if ([long]($outputLines[1].Substring(7)) -ne $entries.Count) {
         throw 'Reported file count does not match the list.'
     }
-    $matches = @($lines | Where-Object { $_ -ceq ('\\?\' + $path) })
-    if ($matches.Count -ne 1) {
-        throw "Expected exactly one path for the held Unicode file; got $($matches.Count)."
+    $expectedPath = if ($path.StartsWith('\\')) { '\\?\UNC\' + $path.Substring(2) } else { '\\?\' + $path }
+    $heldEntries = @($entries | Where-Object { $_.File -ceq $expectedPath })
+    foreach ($expectedPid in @($PID, $holder.Id)) {
+        $perProcess = @($heldEntries | Where-Object { $_.Process.EndsWith(" (PID $expectedPid)") })
+        if ($perProcess.Count -ne 1) {
+            throw "Expected one Unicode file entry for PID $expectedPid; got $($perProcess.Count)."
+        }
     }
-    if (@($lines | Where-Object { $_.Contains($name) -and $_ -cne ('\\?\' + $path) }).Count) {
+    if (@($entries | Where-Object { $_.File.Contains($name) -and $_.File -cne $expectedPath }).Count) {
         throw 'The non-disk pipe appeared in the output.'
     }
     if ($text.Contains('-- More --')) { throw 'Redirected output unexpectedly paged.' }
-    if ($lines.Count -ne @($lines | Select-Object -Unique).Count) {
-        throw 'Duplicate path strings appeared in the output.'
+    $pairs = @($entries | ForEach-Object { $_.Process + "`t" + $_.File })
+    if ($pairs.Count -ne @($pairs | Select-Object -Unique).Count) {
+        throw 'Duplicate process/file pairs appeared in the output.'
     }
-    Write-Host "PASS: Unicode file, deduplication, pipe exclusion, redirected output ($($lines.Count) paths)."
+    Write-Host "PASS: Unicode/shared file, per-process deduplication, grouping, pipe exclusion, summary ($($entries.Count) entries)."
 } finally {
     if ($process) {
         if (-not $process.HasExited) { $process.Kill() }
         $process.Dispose()
+    }
+    if ($holder) {
+        if (-not $holder.HasExited) {
+            $holder.StandardInput.Close()
+            if (-not $holder.WaitForExit(5000)) { $holder.Kill() }
+        }
+        $holder.Dispose()
     }
     if ($pipe) { $pipe.Dispose() }
     if ($second) { $second.Dispose() }
