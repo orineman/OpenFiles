@@ -17,10 +17,19 @@ bin\x64\Release\OpenFiles.exe
 
 Before listing paths, the program prints the time spent inside
 `ListOpenDiskFiles()` in milliseconds and the number of files in its returned
-vector (process/file entries, so a shared file counts once per process). Timing
+vector (process/file entries, so a shared file counts once per process), followed
+by `Hard links`, the sum of the link counts for distinct discovered hard-link
+groups. A path map stores each discovered path and all its linked names; later
+encounters through any cached name or process add nothing. A group with three
+names adds three, including names that are not open. Files with one link add zero. Timing
 uses a monotonic clock and excludes printing and paging delays. Each process
 heading contains its executable's full path and PID, followed by indented file
-paths. Separate instances of the same executable have separate groups.
+paths and `[hard links: N]` when N is greater than one. The link count includes the file's own name, so an
+ordinary file has one link. Separate instances of the same executable have separate groups.
+An asterisk beside a link count (for example, `[hard links: 3*]`) marks the entry
+that added that group to the total. Only that entry displays its enumerated
+linked paths underneath, indented by four spaces. These exclude the open file's
+own path and can include names that are not open; they are not additional open-file entries.
 The console displays roughly one screen at a time, allowing for wrapped paths.
 Space advances a page, Enter advances one path, and Q or Escape exits. `--all`
 disables paging. Redirected output is UTF-8 without a BOM, with no prompts:
@@ -33,11 +42,27 @@ bin\x64\Release\OpenFiles.exe --all > open-files.txt
 
 ```cpp
 // src/OpenFiles.h
-std::vector<std::pair<std::wstring, std::wstring>> ListOpenDiskFiles();
+struct OpenDiskFile {
+    std::wstring processIdentifier;
+    std::wstring path;
+    std::uint32_t hardLinkCount;
+    bool hardLinksAddedToTotal;
+    std::vector<std::wstring> linkedPaths;
+};
+std::vector<OpenDiskFile> ListOpenDiskFiles(std::uint64_t* hardLinkCount = nullptr);
 ```
 
-Each pair contains a process identifier (full executable path plus ` (PID n)`)
-and the full file path. The vector is sorted by process identifier, then by file
+Each entry contains a process identifier (full executable path plus ` (PID n)`),
+the full file path, and the total number of hard links from `FILE_STANDARD_INFO.NumberOfLinks`.
+The count is queried on the same handle as the path, inside the isolated helper.
+The optional output parameter receives the sum for distinct hard-link groups.
+`FindFirstFileNameW` / `FindNextFileNameW` enumerate linked names in the helper,
+under the same query timeout. The parent keeps the path map throughout the scan,
+including across worker restarts. Link-name enumeration is best effort: if it
+fails or returns only some names, uncached aliases may be counted again. Exact
+path keys can also differ through mount aliases or case variants. Filesystem
+changes during the scan can affect both link counts and names.
+The vector is sorted by process identifier, then by file
 path, and contains unique pairs. Multiple handles to one path in the same
 process yield one entry; the same path held by different processes appears once
 for each process, including separate instances of the same executable.
@@ -104,12 +129,25 @@ This keeps two handles to a Unicode-named disk file and an unconnected named pip
 open in the test process, and launches a second process that also holds the file
 open. It verifies one file entry for each PID, deduplication within a process,
 grouped output with process identities, pipe exclusion, the summary and entry
-count, absence of paging prompts when redirected, and enumeration finishing
+count, two links for a file with an extra hard link, no annotation for an ordinary
+file, presence of the hard-link summary, absence of paging prompts when redirected, and enumeration finishing
 within the test deadline. The deadline is a smoke-test guard, not a product-wide
 scan timeout. Interactive page/line/quit behavior should also be checked in a
 Windows console with enough open files to fill several pages.
 
-The implementation was cross-compiled and linked as an x64 Windows executable
-using MinGW-w64 GCC 14 with strict warnings. The Linux development host cannot run
-MSVC or validate native Windows handle enumeration; the Windows smoke test and console
-interaction checks have not been run here.
+The Release x64 build was verified with MSVC v143. The updated Windows smoke
+test requires an elevated PowerShell session and has not been run successfully
+in the current session, which lacks administrator privileges. Interactive
+console paging also remains to be checked manually.
+
+The focused integration test runs without elevation. From an x64 Developer
+Command Prompt, after building the project (which creates `bin` and `obj`):
+
+```bat
+cl /nologo /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 tests\hard-links.cpp /Foobj\hard-links-test.obj /Febin\hard-links-test.exe /link Advapi32.lib
+bin\hard-links-test.exe
+```
+
+It checks actual link-name enumeration through the worker protocol, counts a
+three-name group once, verifies that unopened names are cached, excludes
+ordinary files from the total, and adds an independent group's link count.

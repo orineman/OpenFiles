@@ -5,9 +5,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 namespace {
@@ -185,7 +187,55 @@ bool WriteExact(HANDLE pipe, const void* data, DWORD bytes) {
     return true;
 }
 
-std::wstring QueryDiskPath(HANDLE file) {
+struct FileQueryResult {
+    std::wstring path;
+    DWORD hardLinkCount = 0;
+    std::vector<std::wstring> linkedPaths;
+};
+
+struct FileQueryHeader {
+    DWORD pathLength;
+    DWORD hardLinkCount;
+    DWORD linkedPathCount;
+};
+
+std::vector<std::wstring> QueryHardLinkPaths(const std::wstring& path) {
+    std::wstring root(MaxPathCharacters, L'\0');
+    if (!GetVolumePathNameW(path.c_str(), root.data(), MaxPathCharacters)) return {};
+    root.resize(std::wcslen(root.c_str()));
+    if (!root.empty() && root.back() == L'\\') root.pop_back();
+    std::wstring name(MaxPathCharacters, L'\0');
+    DWORD length = MaxPathCharacters;
+    const HANDLE search = FindFirstFileNameW(path.c_str(), 0, &length, name.data());
+    if (search == INVALID_HANDLE_VALUE) return {};
+    struct SearchCleanup {
+        HANDLE value;
+        ~SearchCleanup() { FindClose(value); }
+    } cleanup{search};
+    std::vector<std::wstring> paths;
+    do {
+        paths.push_back(root + name.c_str());
+        length = MaxPathCharacters;
+    } while (FindNextFileNameW(search, &length, name.data()));
+    return paths;
+}
+
+class HardLinkTracker {
+public:
+    bool Add(const FileQueryResult& file) {
+        if (file.hardLinkCount <= 1 || paths_.find(file.path) != paths_.end()) return false;
+        paths_.emplace(file.path, file.hardLinkCount);
+        for (const auto& path : file.linkedPaths) paths_.emplace(path, file.hardLinkCount);
+        count_ += file.hardLinkCount;
+        return true;
+    }
+    std::uint64_t Count() const noexcept { return count_; }
+private:
+    std::unordered_map<std::wstring, DWORD> paths_;
+    std::uint64_t count_ = 0;
+};
+
+FileQueryResult QueryDiskFile(HANDLE file) {
     // Never ask NtQueryObject(ObjectNameInformation) about arbitrary handles.
     // Even these filtered filesystem calls run only in the disposable worker.
     if (GetFileType(file) != FILE_TYPE_DISK) return {};
@@ -203,7 +253,9 @@ std::wstring QueryDiskPath(HANDLE file) {
     }
     if (!length || length >= path.size()) return {};
     path.resize(length);
-    return path;
+    auto linkedPaths = info.NumberOfLinks > 1 ? QueryHardLinkPaths(path) :
+        std::vector<std::wstring>{};
+    return {std::move(path), info.NumberOfLinks, std::move(linkedPaths)};
 }
 
 // The parent never makes filesystem queries on duplicated foreign handles.
@@ -213,7 +265,7 @@ class QueryWorker {
 public:
     ~QueryWorker() { Stop(); }
 
-    std::wstring Query(HANDLE source, HANDLE original) {
+    FileQueryResult Query(HANDLE source, HANDLE original) {
         if (!process_) Start();
         HANDLE remote = nullptr;
         if (!DuplicateHandle(source, original, process_.get(), &remote,
@@ -225,18 +277,34 @@ public:
             Stop();
             return {};
         }
-        DWORD length = 0;
-        if (!ReadUntil(&length, sizeof(length), deadline) ||
-            length >= MaxPathCharacters) {
+        FileQueryHeader header{};
+        if (!ReadUntil(&header, sizeof(header), deadline) ||
+            header.pathLength >= MaxPathCharacters || header.linkedPathCount > 65536) {
             Stop();
             return {};
         }
+        const DWORD length = header.pathLength;
         std::wstring path(length, L'\0');
         if (length && !ReadUntil(path.data(), length * static_cast<DWORD>(sizeof(wchar_t)), deadline)) {
             Stop();
             return {};
         }
-        return path;
+        FileQueryResult result{std::move(path), header.hardLinkCount, {}};
+        for (DWORD i = 0; i < header.linkedPathCount; ++i) {
+            DWORD linkedLength = 0;
+            if (!ReadUntil(&linkedLength, sizeof(linkedLength), deadline) ||
+                !linkedLength || linkedLength >= MaxPathCharacters) {
+                Stop();
+                return {};
+            }
+            std::wstring linkedPath(linkedLength, L'\0');
+            if (!ReadUntil(linkedPath.data(), linkedLength * static_cast<DWORD>(sizeof(wchar_t)), deadline)) {
+                Stop();
+                return {};
+            }
+            result.linkedPaths.push_back(std::move(linkedPath));
+        }
+        return result;
     }
 private:
     Handle process_, job_, input_, output_;
@@ -347,17 +415,26 @@ int RunFileQueryWorker() {
     ULONG_PTR value = 0;
     while (ReadExact(input, &value, sizeof(value))) {
         Handle file(reinterpret_cast<HANDLE>(value));
-        const std::wstring path = QueryDiskPath(file.get());
+        const auto result = QueryDiskFile(file.get());
         file.reset();
-        const DWORD length = static_cast<DWORD>(path.size());
-        if (!WriteExact(output, &length, sizeof(length)) ||
-            (length && !WriteExact(output, path.data(), length * static_cast<DWORD>(sizeof(wchar_t)))))
+        const FileQueryHeader header{static_cast<DWORD>(result.path.size()), result.hardLinkCount,
+            static_cast<DWORD>(result.linkedPaths.size())};
+        if (!WriteExact(output, &header, sizeof(header)) ||
+            (header.pathLength && !WriteExact(output, result.path.data(),
+                header.pathLength * static_cast<DWORD>(sizeof(wchar_t)))))
             return 1;
+        for (const auto& path : result.linkedPaths) {
+            const DWORD length = static_cast<DWORD>(path.size());
+            if (!WriteExact(output, &length, sizeof(length)) ||
+                !WriteExact(output, path.data(), length * static_cast<DWORD>(sizeof(wchar_t))))
+                return 1;
+        }
     }
     return 0;
 }
 
-std::vector<std::pair<std::wstring, std::wstring>> ListOpenDiskFiles() {
+std::vector<OpenDiskFile> ListOpenDiskFiles(std::uint64_t* hardLinkCount) {
+    if (hardLinkCount) *hardLinkCount = 0;
     DebugPrivilege privilege;
     // Discover the File object type index from a known real file in this very
     // snapshot. Object type numbers are not stable across Windows versions.
@@ -387,10 +464,11 @@ std::vector<std::pair<std::wstring, std::wstring>> ListOpenDiskFiles() {
     });
 
     QueryWorker worker;
+    HardLinkTracker hardLinks;
     Handle process;
     std::wstring processIdentifier;
     ULONG_PTR lastPid = (std::numeric_limits<ULONG_PTR>::max)();
-    std::vector<std::pair<std::wstring, std::wstring>> files;
+    std::vector<OpenDiskFile> files;
     for (const auto& entry : entries) {
         if (entry.UniqueProcessId != lastPid) {
             lastPid = entry.UniqueProcessId;
@@ -405,10 +483,25 @@ std::vector<std::pair<std::wstring, std::wstring>> ListOpenDiskFiles() {
             }
         }
         if (!process) continue;
-        auto path = worker.Query(process.get(), reinterpret_cast<HANDLE>(entry.HandleValue));
-        if (!path.empty()) files.emplace_back(processIdentifier, std::move(path));
+        auto result = worker.Query(process.get(), reinterpret_cast<HANDLE>(entry.HandleValue));
+        if (!result.path.empty()) {
+            const bool counted = hardLinks.Add(result);
+            result.linkedPaths.erase(std::remove(result.linkedPaths.begin(),
+                result.linkedPaths.end(), result.path), result.linkedPaths.end());
+            files.push_back({processIdentifier, std::move(result.path), result.hardLinkCount,
+                counted, counted ? std::move(result.linkedPaths) : std::vector<std::wstring>{}});
+        }
     }
-    std::sort(files.begin(), files.end());
-    files.erase(std::unique(files.begin(), files.end()), files.end());
+    // Preserve the first discovered entry (and its contribution marker) when
+    // multiple handles for the same process/path are removed below.
+    std::stable_sort(files.begin(), files.end(), [](const auto& a, const auto& b) {
+        if (a.processIdentifier != b.processIdentifier)
+            return a.processIdentifier < b.processIdentifier;
+        return a.path < b.path;
+    });
+    files.erase(std::unique(files.begin(), files.end(), [](const auto& a, const auto& b) {
+        return a.processIdentifier == b.processIdentifier && a.path == b.path;
+    }), files.end());
+    if (hardLinkCount) *hardLinkCount = hardLinks.Count();
     return files;
 }

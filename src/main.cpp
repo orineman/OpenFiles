@@ -66,17 +66,19 @@ int wmain(int argc, wchar_t* argv[]) {
         }
 
         const auto start = std::chrono::steady_clock::now();
-        const auto files = ListOpenDiskFiles();
+        std::uint64_t hardLinkCount = 0;
+        const auto files = ListOpenDiskFiles(&hardLinkCount);
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start);
         Print(L"Time taken: " + std::to_wstring(elapsed.count()) + L" ms\r\n" +
-              L"Files: " + std::to_wstring(files.size()) + L"\r\n\r\n");
+              L"Files: " + std::to_wstring(files.size()) + L"\r\n" +
+              L"Hard links: " + std::to_wstring(hardLinkCount) + L"\r\n\r\n");
         DWORD inputMode = 0, outputMode = 0;
         const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
         const bool paginate = !all &&
             GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &inputMode) &&
             GetConsoleMode(output, &outputMode);
-        size_t rows = 3; // include the summary and blank line on the first page
+        size_t rows = 4; // include the summary and blank line on the first page
         const auto printLine = [&](const std::wstring& line, bool more) {
             CONSOLE_SCREEN_BUFFER_INFO screen{};
             size_t pageRows = 23, width = 80;
@@ -95,11 +97,23 @@ int wmain(int argc, wchar_t* argv[]) {
             return true;
         };
         for (size_t i = 0; i < files.size(); ++i) {
-            if (i == 0 || files[i].first != files[i - 1].first) {
+            if (i == 0 || files[i].processIdentifier != files[i - 1].processIdentifier) {
                 if (i != 0 && !printLine(L"", true)) return 0;
-                if (!printLine(files[i].first, true)) return 0;
+                if (!printLine(files[i].processIdentifier, true)) return 0;
             }
-            if (!printLine(L"  " + files[i].second, i + 1 < files.size())) return 0;
+            std::wstring line = L"  " + files[i].path;
+            if (files[i].hardLinkCount > 1)
+                line += L" [hard links: " + std::to_wstring(files[i].hardLinkCount) +
+                    (files[i].hardLinksAddedToTotal ? L"*]" : L"]");
+            const auto& linkedPaths = files[i].linkedPaths;
+            const bool showLinks = files[i].hardLinksAddedToTotal && !linkedPaths.empty();
+            if (!printLine(line, showLinks || i + 1 < files.size())) return 0;
+            if (showLinks) {
+                for (size_t j = 0; j < linkedPaths.size(); ++j) {
+                    if (!printLine(L"    " + linkedPaths[j],
+                        j + 1 < linkedPaths.size() || i + 1 < files.size())) return 0;
+                }
+            }
         }
         return 0;
     } catch (const std::exception& error) {
